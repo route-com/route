@@ -1,0 +1,202 @@
+# TEMPLATE：复制到公开仓库 route-com/route 的 .github/workflows/daily-apk.yml。
+name: 每日 APK 构建与发布
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # UTC 04:00 = 香港时间 12:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-main
+  cancel-in-progress: false
+
+jobs:
+  build-release-apk:
+    if: github.ref == 'refs/heads/main' && github.repository == 'route-com/route'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: 检查可信分支和必需密钥
+        shell: bash
+        env:
+          APK_SOURCE_DEPLOY_KEY: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
+          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          APK_BUILD_ENV: ${{ secrets.APK_BUILD_ENV }}
+          APK_SIGNER_SHA256: ${{ secrets.APK_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$GITHUB_REPOSITORY" == "route-com/route" ]] || { echo '仅允许 route-com/route 的 main 执行。'; exit 1; }
+          for name in APK_SOURCE_DEPLOY_KEY ANDROID_DEBUG_KEYSTORE_BASE64 APK_BUILD_ENV APK_SIGNER_SHA256; do
+            [[ -n "${!name:-}" ]] || { echo "缺少必需的 Actions secret：$name"; exit 1; }
+          done
+          printf 'validate-secrets\n' > "$RUNNER_TEMP/daily-apk-stage"
+
+      - name: 获取可信私有源码 main
+        id: source
+        uses: actions/checkout@v4
+        with:
+          repository: route-com/routeapp
+          ref: main
+          path: source
+          fetch-depth: 0
+          ssh-key: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: 配置 Expo 58 所需 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: 判断是否需要新版本构建
+        id: plan
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          printf 'release-plan\n' > "$RUNNER_TEMP/daily-apk-stage"
+          node scripts/apk-release-plan.cjs --output "$RUNNER_TEMP/apk-release-plan.json"
+
+      - name: 无新变化时结束
+        if: steps.plan.outputs.should_build != 'true'
+        run: echo '源码指纹与最新正式 APK 相同；本次跳过打包，下一次定时运行会再次检查。'
+
+      - name: 配置 Java 17
+        if: steps.plan.outputs.should_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 配置 Android SDK
+        if: steps.plan.outputs.should_build == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 Android SDK、NDK 和 CMake
+        if: steps.plan.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          (yes || true) | sdkmanager --licenses >/dev/null
+          sdkmanager 'platforms;android-37' 'build-tools;37.0.0' 'ndk;27.1.12297006' 'cmake;3.22.1' >/dev/null
+
+      - name: 释放 runner 闲置工具空间
+        if: steps.plan.outputs.should_build == 'true'
+        shell: bash
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/powershell
+
+      - name: 安装源码依赖
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          printf 'npm-ci\n' > "$RUNNER_TEMP/daily-apk-stage"
+          if ! npm ci > "$RUNNER_TEMP/npm-ci.log" 2>&1; then echo '依赖安装失败；日志保留在临时 runner，不会公开上传。'; exit 1; fi
+
+      - name: 应用本次发布版本到 runner 副本
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        run: node scripts/apk-release-plan.cjs --apply-plan "$RUNNER_TEMP/apk-release-plan.json"
+
+      - name: 载入获准的 Expo 构建变量
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        env:
+          APK_BUILD_ENV: ${{ secrets.APK_BUILD_ENV }}
+        run: node scripts/daily-apk.cjs env
+
+      - name: 使用 Expo 生成 Android 工程
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          printf 'expo-prebuild\n' > "$RUNNER_TEMP/daily-apk-stage"
+          npx expo prebuild --platform android --no-install > "$RUNNER_TEMP/expo-prebuild.log" 2>&1 || { echo 'Expo prebuild 失败；详细日志不会公开上传。'; exit 1; }
+
+      - name: 安装现有兼容签名密钥
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        shell: bash
+        env:
+          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf 'install-keystore\n' > "$RUNNER_TEMP/daily-apk-stage"
+          printf '%s' "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 --decode > android/app/debug.keystore
+          chmod 600 android/app/debug.keystore
+          keytool -list -keystore android/app/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+
+      - name: 构建独立 Release APK
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source/android
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          printf 'gradle-release\n' > "$RUNNER_TEMP/daily-apk-stage"
+          chmod +x gradlew
+          if ! ./gradlew -PreactNativeArchitectures=arm64-v8a,x86_64 --max-workers=2 assembleRelease --no-daemon --console=plain > "$RUNNER_TEMP/gradle-release.log" 2>&1; then
+            echo 'Gradle Release 构建失败；完整日志保留在临时 runner，不会公开上传。'
+            exit 1
+          fi
+
+      - name: 校验包信息、签名、资源和校验和
+        if: steps.plan.outputs.should_build == 'true'
+        id: verify
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_REVISION: ${{ steps.plan.outputs.sourceRevision }}
+          APK_BUILD_FINGERPRINT: ${{ steps.plan.outputs.sourceFingerprint }}
+          APK_SIGNER_SHA256: ${{ secrets.APK_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          printf 'verify-apk\n' > "$RUNNER_TEMP/daily-apk-stage"
+          export AAPT="$ANDROID_HOME/build-tools/37.0.0/aapt"
+          export APKSIGNER="$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          mkdir -p "$RUNNER_TEMP/release-artifacts"
+          apk='android/app/build/outputs/apk/release/app-release.apk'
+          artifact="xingji-${{ steps.plan.outputs.version }}-v${{ steps.plan.outputs.versionCode }}-android.apk"
+          node scripts/daily-apk.cjs verify "$apk" '${{ steps.plan.outputs.version }}' '${{ steps.plan.outputs.versionCode }}' "$RUNNER_TEMP/release-artifacts/$artifact.json" > "$RUNNER_TEMP/verify-result.json"
+          cp "$apk" "$RUNNER_TEMP/release-artifacts/$artifact"
+          cat "$RUNNER_TEMP/verify-result.json"
+
+      - name: 创建草稿、校验资产后发布正式 Release
+        if: steps.plan.outputs.should_build == 'true'
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf 'publish-release\n' > "$RUNNER_TEMP/daily-apk-stage"
+          artifact="xingji-${{ steps.plan.outputs.version }}-v${{ steps.plan.outputs.versionCode }}-android.apk"
+          node scripts/apk-publish.cjs "$RUNNER_TEMP/release-artifacts/$artifact" "$RUNNER_TEMP/release-artifacts/$artifact.json"
+
+      - name: 保存安全失败摘要
+        if: failure()
+        shell: bash
+        run: |
+          stage='unknown'
+          [[ -f "$RUNNER_TEMP/daily-apk-stage" ]] && stage="$(cat "$RUNNER_TEMP/daily-apk-stage")"
+          printf 'Android Release 构建失败阶段：%s\n源码 revision：%s\n完整构建日志未上传，避免公开私有源码或环境信息。\n请在可信本地环境按 Expo 58 CNG 与 Release 流程复现。\n' "$stage" '${{ steps.source.outputs.commit }}' > "$RUNNER_TEMP/daily-apk-failure.txt"
+
+      - name: 上传安全失败摘要
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-failure-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/daily-apk-failure.txt
+          if-no-files-found: ignore
+          retention-days: 14
