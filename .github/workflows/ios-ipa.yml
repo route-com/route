@@ -3,7 +3,7 @@ name: iOS IPA 自动构建与发布
 
 on:
   schedule:
-    - cron: '0 5 * * *' # UTC 05:00 = 北京时间 13:00
+    - cron: '0 22 * * *' # UTC 22:00 = 东八区 06:00
   workflow_dispatch:
     inputs:
       source_ref:
@@ -11,6 +11,11 @@ on:
         required: false
         default: 'main'
         type: string
+      force_build:
+        description: '即使源码无变化也强制重新打包'
+        required: false
+        default: false
+        type: boolean
       publish_release:
         description: '构建完成后自动发布 .ipa 到当前仓库 Release'
         required: false
@@ -67,7 +72,69 @@ jobs:
           cache: npm
           cache-dependency-path: source/package-lock.json
 
+      - name: 判断是否需要构建新 IPA
+        id: plan
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REV: ${{ steps.source.outputs.commit }}
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+        run: |
+          set -euo pipefail
+          printf 'ipa-release-plan\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          node -e '
+            const fs = require("fs");
+            const { spawnSync } = require("child_process");
+            (async () => {
+              const force = process.env.FORCE_BUILD === "true";
+              const sourceRev = String(process.env.SOURCE_REV || "").trim();
+              if (force) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "should_build=true\nreason=force_build\n");
+                return;
+              }
+              const res = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases?per_page=20`, {
+                headers: {
+                  Authorization: "Bearer " + process.env.GH_TOKEN,
+                  Accept: "application/vnd.github+json",
+                },
+              });
+              if (!res.ok) {
+                console.log("Release lookup returned " + res.status + "; proceeding with build.");
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "should_build=true\nreason=lookup_fallback\n");
+                return;
+              }
+              const releases = await res.json();
+              const latestIpaRelease = Array.isArray(releases)
+                ? releases.find(r => !r.draft && Array.isArray(r.assets) && r.assets.some(a => /\.ipa$/i.test(a.name)))
+                : null;
+              if (!latestIpaRelease) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "should_build=true\nreason=no_previous_ipa\n");
+                return;
+              }
+              const body = String(latestIpaRelease.body || "");
+              const match = body.match(/iOS source revision:\s*([0-9a-f]{7,40})/i) || body.match(/source revision:\s*([0-9a-f]{7,40})/i);
+              const lastRev = match ? match[1].trim() : "";
+              if (!lastRev) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "should_build=true\nreason=no_recorded_revision\n");
+                return;
+              }
+              let unchanged = lastRev === sourceRev;
+              if (!unchanged) {
+                const diff = spawnSync("git", ["diff", "--quiet", lastRev, "HEAD"], { stdio: "ignore" });
+                unchanged = diff.status === 0;
+              }
+              const shouldBuild = !unchanged;
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `should_build=${shouldBuild}\nlast_rev=${lastRev}\n`);
+            })().catch(err => { console.error(err); process.exit(1); });
+          '
+
+      - name: 源码无变化时跳过打包
+        if: steps.plan.outputs.should_build != 'true'
+        run: echo '源码与最近一次成功发布的 iOS IPA 一致；本次跳过构建。'
+
       - name: 读取应用版本信息
+        if: steps.plan.outputs.should_build == 'true'
         id: meta
         working-directory: source
         shell: bash
@@ -86,6 +153,7 @@ jobs:
           "
 
       - name: 安装源码依赖
+        if: steps.plan.outputs.should_build == 'true'
         working-directory: source
         shell: bash
         run: |
@@ -96,13 +164,14 @@ jobs:
           fi
 
       - name: 载入获准的 Expo 构建变量
-        if: secrets.APK_BUILD_ENV != ''
+        if: steps.plan.outputs.should_build == 'true' && secrets.APK_BUILD_ENV != ''
         working-directory: source
         env:
           APK_BUILD_ENV: ${{ secrets.APK_BUILD_ENV }}
         run: node scripts/daily-apk.cjs env
 
       - name: 使用 Expo 生成 iOS 工程与 CocoaPods
+        if: steps.plan.outputs.should_build == 'true'
         working-directory: source
         shell: bash
         env:
@@ -116,6 +185,7 @@ jobs:
           (cd ios && pod install --repo-update > "$RUNNER_TEMP/pod-install.log" 2>&1) || (cd ios && pod install > "$RUNNER_TEMP/pod-install.log" 2>&1) || { echo 'CocoaPods 安装失败；详细日志不公开上传。'; exit 1; }
 
       - name: 编译并打包 Release IPA
+        if: steps.plan.outputs.should_build == 'true'
         id: package
         working-directory: source
         shell: bash
@@ -234,6 +304,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/ExportOptions.plist"
 
       - name: 上传 IPA 工作流产物
+        if: steps.plan.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ios-release-${{ steps.meta.outputs.version }}-${{ github.run_number }}
@@ -242,7 +313,7 @@ jobs:
           retention-days: 14
 
       - name: 仅上传 .ipa 到当前仓库 Release
-        if: inputs.publish_release != false
+        if: steps.plan.outputs.should_build == 'true' && inputs.publish_release != false
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -270,17 +341,17 @@ jobs:
                 Authorization: "Bearer " + token,
                 Accept: "application/vnd.github+json",
               };
+              const iosSection = [
+                `iOS IPA: ${process.env.ARTIFACT_NAME}`,
+                `iOS Size: ${process.env.IPA_SIZE} bytes`,
+                `iOS SHA-256: ${process.env.IPA_SHA256}`,
+                `iOS source revision: ${process.env.SOURCE_REV}`,
+                `iOS 签名: ${process.env.SIGNED === "true" ? "已签名 (" + (process.env.EXPORT_METHOD || "ad-hoc") + ")" : "未签名构建（需重签或配置证书 Secrets）"}`,
+              ].join("\n");
               let res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`, { headers });
               let rel;
               if (res.status === 404) {
-                const body = [
-                  `version: ${version} (build ${process.env.BUILD_NUMBER})`,
-                  `iOS IPA: ${process.env.ARTIFACT_NAME}`,
-                  `Size: ${process.env.IPA_SIZE} bytes`,
-                  `SHA-256: ${process.env.IPA_SHA256}`,
-                  `source revision: ${process.env.SOURCE_REV}`,
-                  `签名: ${process.env.SIGNED === "true" ? "已签名 (" + (process.env.EXPORT_METHOD || "ad-hoc") + ")" : "未签名构建（需重签或配置证书 Secrets）"}`,
-                ].join("\n");
+                const body = `version: ${version} (build ${process.env.BUILD_NUMBER})\nsource revision: ${process.env.SOURCE_REV}\n` + iosSection;
                 res = await fetch(`https://api.github.com/repos/${repo}/releases`, {
                   method: "POST",
                   headers: { ...headers, "Content-Type": "application/json" },
@@ -290,6 +361,15 @@ jobs:
                 rel = await res.json();
               } else if (res.ok) {
                 rel = await res.json();
+                const cleaned = String(rel.body || "")
+                  .replace(/\n*iOS IPA:[\s\S]*$/m, "")
+                  .trimEnd();
+                const updatedBody = cleaned ? `${cleaned}\n\n${iosSection}` : iosSection;
+                await fetch(rel.url, {
+                  method: "PATCH",
+                  headers: { ...headers, "Content-Type": "application/json" },
+                  body: JSON.stringify({ body: updatedBody }),
+                });
               } else {
                 throw new Error(`Query release failed: ${res.status} ${await res.text()}`);
               }
