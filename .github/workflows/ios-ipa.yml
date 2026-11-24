@@ -1,0 +1,333 @@
+# TEMPLATE：复制到公开仓库 route-com/route 的 .github/workflows/ios-ipa.yml。
+name: iOS IPA 自动构建与发布
+
+on:
+  schedule:
+    - cron: '0 5 * * *' # UTC 05:00 = 北京时间 13:00
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '源码分支或提交（默认 main）'
+        required: false
+        default: 'main'
+        type: string
+      publish_release:
+        description: '构建完成后自动发布 .ipa 到当前仓库 Release'
+        required: false
+        default: true
+        type: boolean
+      export_method:
+        description: '已配置 iOS 签名证书时的导出方式'
+        required: false
+        default: 'ad-hoc'
+        type: choice
+        options:
+          - ad-hoc
+          - development
+          - app-store
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-release-ipa
+  cancel-in-progress: false
+
+jobs:
+  build-release-ipa:
+    if: github.ref == 'refs/heads/main' && github.repository == 'route-com/route'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: 检查可信分支和源码访问密钥
+        shell: bash
+        env:
+          APK_SOURCE_DEPLOY_KEY: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$GITHUB_REPOSITORY" == "route-com/route" ]] || { echo '仅允许 route-com/route 的 main 执行。'; exit 1; }
+          [[ -n "${APK_SOURCE_DEPLOY_KEY:-}" ]] || { echo '缺少必需的 Actions secret：APK_SOURCE_DEPLOY_KEY'; exit 1; }
+          printf 'validate-secrets\n' > "$RUNNER_TEMP/ios-ipa-stage"
+
+      - name: 获取私有源码
+        id: source
+        uses: actions/checkout@v4
+        with:
+          repository: route-com/routeapp
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: source
+          fetch-depth: 0
+          ssh-key: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: 读取应用版本信息
+        id: meta
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'read-metadata\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const app = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+            const version = String(pkg.version || app.expo?.version || '1.0.0').trim();
+            const buildNumber = String(app.expo?.ios?.buildNumber || app.expo?.android?.versionCode || process.env.GITHUB_RUN_NUMBER || '1');
+            const bundleId = String(app.expo?.ios?.bundleIdentifier || 'com.xingji.route');
+            const out = process.env.GITHUB_OUTPUT;
+            fs.appendFileSync(out, 'version=' + version + '\nbuildNumber=' + buildNumber + '\nbundleId=' + bundleId + '\n');
+          "
+
+      - name: 安装源码依赖
+        working-directory: source
+        shell: bash
+        run: |
+          printf 'npm-ci\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          if ! npm ci > "$RUNNER_TEMP/npm-ci.log" 2>&1; then
+            echo '依赖安装失败；详细日志保留在临时 runner，不公开上传。'
+            exit 1
+          fi
+
+      - name: 载入获准的 Expo 构建变量
+        if: secrets.APK_BUILD_ENV != ''
+        working-directory: source
+        env:
+          APK_BUILD_ENV: ${{ secrets.APK_BUILD_ENV }}
+        run: node scripts/daily-apk.cjs env
+
+      - name: 使用 Expo 生成 iOS 工程与 CocoaPods
+        working-directory: source
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          printf 'expo-prebuild-ios\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          npx expo prebuild --platform ios --clean --no-install > "$RUNNER_TEMP/expo-prebuild-ios.log" 2>&1 || { echo 'Expo prebuild iOS 失败；详细日志不公开上传。'; exit 1; }
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.meta.outputs.version }}" -c "Set :CFBundleVersion ${{ steps.meta.outputs.buildNumber }}" ios/app/Info.plist
+          printf 'pod-install\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          (cd ios && pod install --repo-update > "$RUNNER_TEMP/pod-install.log" 2>&1) || (cd ios && pod install > "$RUNNER_TEMP/pod-install.log" 2>&1) || { echo 'CocoaPods 安装失败；详细日志不公开上传。'; exit 1; }
+
+      - name: 编译并打包 Release IPA
+        id: package
+        working-directory: source
+        shell: bash
+        env:
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          EXPORT_METHOD: ${{ inputs.export_method || 'ad-hoc' }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.buildNumber }}
+          BUNDLE_ID: ${{ steps.meta.outputs.bundleId }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-artifacts"
+          SIGNED=false
+
+          if [[ -n "${IOS_P12_BASE64:-}" && -n "${IOS_P12_PASSWORD:-}" && -n "${IOS_PROVISIONING_PROFILE_BASE64:-}" ]]; then
+            printf 'ios-signed-archive\n' > "$RUNNER_TEMP/ios-ipa-stage"
+            printf '%s' "$IOS_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+            KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+            KEYCHAIN_PASS="$(uuidgen)"
+            security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$IOS_P12_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+            EXISTING_KEYCHAINS=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+            security list-keychains -d user -s "$KEYCHAIN" $EXISTING_KEYCHAINS
+
+            security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" "$RUNNER_TEMP/profile.plist")
+            PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" "$RUNNER_TEMP/profile.plist")
+            TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$RUNNER_TEMP/profile.plist")
+
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+
+            cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${EXPORT_METHOD}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+            xcodebuild -workspace ios/app.xcworkspace -scheme app -configuration Release \
+              -archivePath "$RUNNER_TEMP/app.xcarchive" \
+              -destination "generic/platform=iOS" \
+              MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              DEVELOPMENT_TEAM="$TEAM_ID" \
+              archive > "$RUNNER_TEMP/xcodebuild-archive.log" 2>&1 || { echo 'Xcode archive 失败；详细日志不公开上传。'; exit 1; }
+
+            printf 'ios-export-ipa\n' > "$RUNNER_TEMP/ios-ipa-stage"
+            xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" \
+              -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+              -exportPath "$RUNNER_TEMP/export" > "$RUNNER_TEMP/xcodebuild-export.log" 2>&1 || { echo 'Xcode exportArchive 失败；详细日志不公开上传。'; exit 1; }
+
+            EXPORTED_IPA=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -n 1)
+            [[ -f "$EXPORTED_IPA" ]] || { echo '未生成签名 IPA 文件'; exit 1; }
+            ARTIFACT_NAME="xingji-${VERSION}-ios-arm64.ipa"
+            cp "$EXPORTED_IPA" "$RUNNER_TEMP/release-artifacts/$ARTIFACT_NAME"
+            SIGNED=true
+          else
+            printf 'ios-unsigned-build\n' > "$RUNNER_TEMP/ios-ipa-stage"
+            xcodebuild -workspace ios/app.xcworkspace -scheme app -configuration Release \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$RUNNER_TEMP/dd" \
+              MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              build > "$RUNNER_TEMP/xcodebuild-unsigned.log" 2>&1 || { echo 'Xcode Release 构建失败；详细日志不公开上传。'; exit 1; }
+
+            APP_PATH="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/app.app"
+            [[ -d "$APP_PATH" && -f "$APP_PATH/main.jsbundle" ]] || { echo 'Release app.app 或 main.jsbundle 缺失'; exit 1; }
+            rm -rf "$RUNNER_TEMP/ipa-stage"
+            mkdir -p "$RUNNER_TEMP/ipa-stage/Payload"
+            ditto "$APP_PATH" "$RUNNER_TEMP/ipa-stage/Payload/app.app"
+            ARTIFACT_NAME="xingji-${VERSION}-ios-arm64-unsigned.ipa"
+            (cd "$RUNNER_TEMP/ipa-stage" && zip -qry "$RUNNER_TEMP/release-artifacts/$ARTIFACT_NAME" Payload)
+          fi
+
+          IPA_PATH="$RUNNER_TEMP/release-artifacts/$ARTIFACT_NAME"
+          IPA_SIZE=$(stat -f %z "$IPA_PATH")
+          IPA_SHA256=$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')
+          echo "artifactName=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "ipaPath=$IPA_PATH" >> "$GITHUB_OUTPUT"
+          echo "ipaSize=$IPA_SIZE" >> "$GITHUB_OUTPUT"
+          echo "ipaSha256=$IPA_SHA256" >> "$GITHUB_OUTPUT"
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+          echo "IPA packaged: $ARTIFACT_NAME ($IPA_SIZE bytes, signed=$SIGNED)"
+
+      - name: 清理临时签名凭据
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$RUNNER_TEMP/build.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/build.keychain-db" >/dev/null 2>&1 || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: 上传 IPA 工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-${{ steps.meta.outputs.version }}-${{ github.run_number }}
+          path: ${{ steps.package.outputs.ipaPath }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 仅上传 .ipa 到当前仓库 Release
+        if: inputs.publish_release != false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.buildNumber }}
+          ARTIFACT_NAME: ${{ steps.package.outputs.artifactName }}
+          IPA_PATH: ${{ steps.package.outputs.ipaPath }}
+          IPA_SIZE: ${{ steps.package.outputs.ipaSize }}
+          IPA_SHA256: ${{ steps.package.outputs.ipaSha256 }}
+          SIGNED: ${{ steps.package.outputs.signed }}
+          EXPORT_METHOD: ${{ inputs.export_method || 'ad-hoc' }}
+          SOURCE_REV: ${{ steps.source.outputs.commit }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          printf 'publish-release\n' > "$RUNNER_TEMP/ios-ipa-stage"
+          node -e '
+            const fs = require("fs");
+            (async () => {
+              const token = process.env.GH_TOKEN;
+              const repo = process.env.GITHUB_REPOSITORY;
+              const version = process.env.VERSION;
+              const tag = "v" + version;
+              const headers = {
+                Authorization: "Bearer " + token,
+                Accept: "application/vnd.github+json",
+              };
+              let res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`, { headers });
+              let rel;
+              if (res.status === 404) {
+                const body = [
+                  `version: ${version} (build ${process.env.BUILD_NUMBER})`,
+                  `iOS IPA: ${process.env.ARTIFACT_NAME}`,
+                  `Size: ${process.env.IPA_SIZE} bytes`,
+                  `SHA-256: ${process.env.IPA_SHA256}`,
+                  `source revision: ${process.env.SOURCE_REV}`,
+                  `签名: ${process.env.SIGNED === "true" ? "已签名 (" + (process.env.EXPORT_METHOD || "ad-hoc") + ")" : "未签名构建（需重签或配置证书 Secrets）"}`,
+                ].join("\n");
+                res = await fetch(`https://api.github.com/repos/${repo}/releases`, {
+                  method: "POST",
+                  headers: { ...headers, "Content-Type": "application/json" },
+                  body: JSON.stringify({ tag_name: tag, target_commitish: "main", name: `行迹 ${version}`, body, draft: false, prerelease: false }),
+                });
+                if (!res.ok) throw new Error(`Create release failed: ${res.status} ${await res.text()}`);
+                rel = await res.json();
+              } else if (res.ok) {
+                rel = await res.json();
+              } else {
+                throw new Error(`Query release failed: ${res.status} ${await res.text()}`);
+              }
+
+              const existingNames = new Set((rel.assets || []).map(a => a.name));
+              let uploadName = process.env.ARTIFACT_NAME;
+              if (existingNames.has(uploadName)) {
+                uploadName = uploadName.replace(/\.ipa$/i, `-run${process.env.RUN_NUM}.ipa`);
+              }
+              const uploadBase = rel.upload_url.replace(/\{\?name,label\}$/, "");
+              const bytes = fs.readFileSync(process.env.IPA_PATH);
+              const upRes = await fetch(`${uploadBase}?name=${encodeURIComponent(uploadName)}`, {
+                method: "POST",
+                headers: { ...headers, "Content-Type": "application/octet-stream", "Content-Length": String(bytes.length) },
+                body: bytes,
+              });
+              if (!upRes.ok) throw new Error(`Upload asset failed: ${upRes.status} ${await upRes.text()}`);
+              const asset = await upRes.json();
+              if (asset.state !== "uploaded" || asset.size !== Number(process.env.IPA_SIZE)) {
+                throw new Error(`Uploaded asset verification mismatch: state=${asset.state} size=${asset.size}`);
+              }
+              console.log(`Published IPA: ${asset.browser_download_url} (${asset.size} bytes)`);
+            })().catch(err => { console.error(err); process.exit(1); });
+          '
+
+      - name: 保存安全失败摘要
+        if: failure()
+        shell: bash
+        run: |
+          stage='unknown'
+          [[ -f "$RUNNER_TEMP/ios-ipa-stage" ]] && stage="$(cat "$RUNNER_TEMP/ios-ipa-stage")"
+          printf 'iOS Release 构建失败阶段：%s\n源码 revision：%s\n完整构建日志未上传，避免公开私有源码或环境信息。\n' "$stage" '${{ steps.source.outputs.commit }}' > "$RUNNER_TEMP/ios-ipa-failure.txt"
+
+      - name: 上传安全失败摘要
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-failure-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ipa-failure.txt
+          if-no-files-found: ignore
+          retention-days: 14
