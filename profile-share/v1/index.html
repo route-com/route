@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
+    <meta name="robots" content="noindex, nofollow">
+    <title>行迹 · 个人主页</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./page.js"></script>
+  </head>
+  <body>
+    <main>
+      <header class="brand">行迹</header>
+      <section class="profile" aria-labelledby="name">
+        <div id="avatar" class="avatar" aria-hidden="true" hidden><span id="initial"></span></div>
+        <h1 id="name">正在打开个人主页</h1>
+        <p id="bio" class="bio" hidden></p>
+        <p id="status" class="status" role="status"></p>
+        <noscript><p class="status">请启用 JavaScript 后重新打开此链接。</p></noscript>
+      </section>
+      <div class="actions">
+        <a id="open" class="primary" hidden>在行迹 App 中打开</a>
+        <button id="retry" class="primary" type="button" hidden>重新加载</button>
+        <a class="secondary" href="https://routex.asia/">下载行迹</a>
+      </div>
+    </main>
+  </body>
+</html>
