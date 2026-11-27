@@ -1,21 +1,19 @@
 # TEMPLATE：复制到公开仓库 route-com/route 的 .github/workflows/daily-apk.yml。
-name: 每日 APK 构建与发布
+name: Android 通知测试包
 
 on:
-  schedule:
-    - cron: '0 22 * * *' # UTC 22:00 = 东八区 06:00
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-release-main
+  group: android-notification-qa
   cancel-in-progress: false
 
 jobs:
   build-release-apk:
-    if: github.ref == 'refs/heads/main' && github.repository == 'route-com/route'
+    if: github.ref == 'refs/heads/codex/qa-notifications-apk' && github.repository == 'route-com/route'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -28,18 +26,18 @@ jobs:
           APK_SIGNER_SHA256: ${{ secrets.APK_SIGNER_SHA256 }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF" == "refs/heads/main" && "$GITHUB_REPOSITORY" == "route-com/route" ]] || { echo '仅允许 route-com/route 的 main 执行。'; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/codex/qa-notifications-apk" && "$GITHUB_REPOSITORY" == "route-com/route" ]] || { echo '仅允许可信的通知测试构建分支执行。'; exit 1; }
           for name in APK_SOURCE_DEPLOY_KEY ANDROID_DEBUG_KEYSTORE_BASE64 APK_BUILD_ENV APK_SIGNER_SHA256; do
             [[ -n "${!name:-}" ]] || { echo "缺少必需的 Actions secret：$name"; exit 1; }
           done
           printf 'validate-secrets\n' > "$RUNNER_TEMP/daily-apk-stage"
 
-      - name: 获取可信私有源码 main
+      - name: 获取已核对的通知测试提交
         id: source
         uses: actions/checkout@v4
         with:
           repository: route-com/routeapp
-          ref: main
+          ref: fe2c214ef49b1a9109cd99ea65f36492fbc27ac9
           path: source
           fetch-depth: 0
           ssh-key: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
@@ -51,6 +49,11 @@ jobs:
           node-version: '22.13.1'
           cache: npm
           cache-dependency-path: source/package-lock.json
+
+      - name: 确认测试提交
+        working-directory: source
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = 'fe2c214ef49b1a9109cd99ea65f36492fbc27ac9'
 
       - name: 判断是否需要新版本构建
         id: plan
@@ -175,17 +178,35 @@ jobs:
           cp "$apk" "$RUNNER_TEMP/release-artifacts/$artifact"
           cat "$RUNNER_TEMP/verify-result.json"
 
-      - name: 创建草稿、校验资产后发布正式 Release
+      - name: 核对本包是否有个推应用配置
         if: steps.plan.outputs.should_build == 'true'
-        working-directory: source
+        shell: bash
+        run: |
+          if [[ -n "${EXPO_PUBLIC_GETUI_APPID:-}" ]]; then
+            echo '个推应用 ID 已配置。'
+          else
+            echo '个推应用 ID 缺失，APK 可用于安装和界面验证。'
+          fi
+
+      - name: 发布签名测试 APK
+        if: steps.plan.outputs.should_build == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          VERSION_CODE: ${{ steps.plan.outputs.versionCode }}
+          SOURCE_REVISION: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          printf 'publish-release\n' > "$RUNNER_TEMP/daily-apk-stage"
-          artifact="xingji-${{ steps.plan.outputs.version }}-v${{ steps.plan.outputs.versionCode }}-android.apk"
-          node scripts/apk-publish.cjs "$RUNNER_TEMP/release-artifacts/$artifact" "$RUNNER_TEMP/release-artifacts/$artifact.json"
+          tag="v${VERSION}-notifications-qa-${GITHUB_RUN_ID}"
+          folder="$RUNNER_TEMP/release-artifacts"
+          apk="$folder/xingji-$VERSION-v$VERSION_CODE-android.apk"
+          printf '通知功能 Android 真机测试包。\n\n源码提交 `%s`，Android versionCode `%s`。\n' "$SOURCE_REVISION" "$VERSION_CODE" > "$RUNNER_TEMP/qa-notes.md"
+          if [[ -z "${EXPO_PUBLIC_GETUI_APPID:-}" ]]; then
+            printf '\n个推应用 ID 尚未配置，后台推送联调需补齐服务配置。\n' >> "$RUNNER_TEMP/qa-notes.md"
+          fi
+          gh release create "$tag" "$apk" "$apk.json" --target "$GITHUB_SHA" --title "行迹 $VERSION Android 通知测试包" --notes-file "$RUNNER_TEMP/qa-notes.md" --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          gh release view "$tag" --json url,assets,isPrerelease --repo "$GITHUB_REPOSITORY"
 
       - name: 保存安全失败摘要
         if: failure()
