@@ -161,9 +161,9 @@ jobs:
           selected = []
           for line in lines:
               clean = re.sub(r'/home/runner/[^ :\t]+', '<runner-path>', line.strip())
-              if re.search(r'^(?:Execution failed for task|A problem occurred|Gradle build daemon disappeared|> (?:Could not|Failed to|Process |Unsupported |No version|The Android|No matching)|ERROR:)',clean):
+              if re.search(r'^(?:e: |Compilation error|Execution failed for task|A problem occurred|Gradle build daemon disappeared|> (?:Could not|Failed to|Process |Unsupported |No version|The Android|No matching)|ERROR:)',clean):
                   selected.append(clean[:260])
-          print('\n'.join(list(dict.fromkeys(selected))[-18:]) or 'No Gradle error summary available')
+          print('\n'.join(list(dict.fromkeys(selected))[-40:]) or 'No Gradle error summary available')
           PYTHON
             exit 1
           fi
