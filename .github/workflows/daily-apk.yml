@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: route-com/routeapp
-          ref: fe2c214ef49b1a9109cd99ea65f36492fbc27ac9
+          ref: e08fd7e2b399e593f8e216168b26bf37e2a48fc4
           path: source
           fetch-depth: 0
           ssh-key: ${{ secrets.APK_SOURCE_DEPLOY_KEY }}
@@ -53,7 +53,7 @@ jobs:
       - name: 确认测试提交
         working-directory: source
         shell: bash
-        run: test "$(git rev-parse HEAD)" = 'fe2c214ef49b1a9109cd99ea65f36492fbc27ac9'
+        run: test "$(git rev-parse HEAD)" = 'e08fd7e2b399e593f8e216168b26bf37e2a48fc4'
 
       - name: 判断是否需要新版本构建
         id: plan
@@ -154,6 +154,17 @@ jobs:
           chmod +x gradlew
           if ! ./gradlew -PreactNativeArchitectures=arm64-v8a,x86_64 --max-workers=2 assembleRelease --no-daemon --console=plain > "$RUNNER_TEMP/gradle-release.log" 2>&1; then
             echo 'Gradle Release 构建失败；完整日志保留在临时 runner，不会公开上传。'
+            python3 - "$RUNNER_TEMP/gradle-release.log" <<'PYTHON'
+          import re, sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(errors='replace').splitlines()
+          selected = []
+          for line in lines:
+              clean = re.sub(r'/home/runner/[^ :\t]+', '<runner-path>', line.strip())
+              if re.search(r'^(?:Execution failed for task|A problem occurred|Gradle build daemon disappeared|> (?:Could not|Failed to|Process |Unsupported |No version|The Android|No matching)|ERROR:)',clean):
+                  selected.append(clean[:260])
+          print('\n'.join(list(dict.fromkeys(selected))[-18:]) or 'No Gradle error summary available')
+          PYTHON
             exit 1
           fi
 
