@@ -1,0 +1,12 @@
+{
+  "id": "./?open=notifications",
+  "name": "行迹通知",
+  "short_name": "行迹通知",
+  "lang": "zh-CN",
+  "start_url": "./index.html?open=notifications",
+  "scope": "./",
+  "display": "standalone",
+  "icons": [
+    { "src": "./notification-icon.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
